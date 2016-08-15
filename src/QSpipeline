@@ -1,0 +1,394 @@
+#!/usr/bin/env python
+
+"""
+    usage:
+      QSpipeline [options] reference.fa read1.fq [read2.fq]
+
+    where the options are:
+        -h,--help : print usage and quit
+        -d,--debug: print debug information
+        -o,--outdir: the output directory [report]
+        -p,--pear : the path to the PEAR executable [pear]
+        -b,--bwa : the path to the BWA executable [bwa]
+        -l,--lastz: the path to the LASTZ executable [lastz]
+        -s,--samtools: the path to the SAMtools executable [samtools]
+        -t,--threshold: prevelance threshold for quasispecies to be output [0.01]
+        -q,--quasirecomb: the path to QuasiRecomb.jar [QuasiRecomb.jar]
+        -z,--uselastz: use LASTZ instead of BWA for the alignments
+
+    By default BWA is used for the alignments. 
+"""
+
+from sys import argv, stderr, stdin, exit, stdout
+from getopt import getopt, GetoptError
+from hashlib import md5
+from os import mkdir, path, getcwd, chdir
+from subprocess import call,Popen,PIPE
+from tempfile import mkstemp
+from collections import Counter
+
+from Bio.Seq import Seq
+
+__author__ = "Aakrosh Ratan"
+__email__  = "ratan@bx.psu.edu"
+
+# do we want the debug information to be printed?
+debug_flag = False
+
+class Sequence:
+    pass
+
+def NextFqPair(fq1Name, fq2Name):
+    if fq2Name == None:
+        with open(fq1Name,"r") as f1:
+            seq1 = Sequence()
+            numread = 0
+        
+            while True:
+                l1 = f1.readline()
+                if (not l1): break
+
+                numread += 1
+
+                if numread == 1:
+                    seq1.name = l1.strip()
+                elif numread == 2:
+                    seq1.seq = l1.strip()
+                elif numread == 3:
+                    pass
+                elif numread == 4:
+                    seq1.qual = l1.strip()
+                    numread = 0
+                    yield seq1,None
+    else:
+        with open(fq1Name,"r") as f1, open(fq2Name, "r") as f2:
+            seq1 = Sequence()
+            seq2 = Sequence()
+            numread = 0
+
+            while True:
+                l1 = f1.readline()
+                l2 = f2.readline()
+                if (not l1) or (not l2): break
+
+                numread += 1
+
+                if numread == 1:
+                    seq1.name = l1.strip()
+                    seq2.name = l2.strip()
+                elif numread == 2:
+                    seq1.seq = l1.strip()
+                    seq2.seq = l2.strip()
+                elif numread == 3:
+                    pass
+                elif numread == 4:
+                    seq1.qual = l1.strip()
+                    seq2.qual = l2.strip()
+                    numread = 0
+                    yield seq1,seq2
+
+def PrintFastqSequence(f,seq):
+    print >> f, seq.name
+    print >> f, seq.seq
+    print >> f, "+"
+    print >> f, seq.qual
+
+def RemovePCRDups(outdir, fq1Name, fq2Name):
+    '''Remove putative PCR duplicates.
+    '''
+    hashes = set()
+    numpairs = 0
+    numdups = 0
+
+    f1 = open("%s/read1.fq" % outdir, "w")
+    f2 = open("%s/read2.fq" % outdir, "w")
+
+    for seq1,seq2 in NextFqPair(fq1Name, fq2Name):
+        numpairs += 1
+        
+        sequence = seq1.seq 
+        if seq2: sequence += seq2.seq
+        shash = md5(sequence).hexdigest()
+        if shash in hashes:
+            numdups += 1
+            continue
+        else:
+            PrintFastqSequence(f1, seq1)
+            if seq2: PrintFastqSequence(f2, seq2)
+            hashes.add(shash)
+
+    print >> stderr, "%d of %d (%0.2f%%) putative PCR duplicates removed." \
+           % (numdups, numpairs, numdups * 100.0 / numpairs)
+
+    f1.close()
+    f2.close()
+
+def CreateTempFile():
+    """ Use mkstemp to create a temporary file
+    """
+    fd,name = mkstemp(dir = ".")
+    os.close(fd)
+    return name
+
+def RemoveTempFile(name):
+    try:
+        os.remove(name)
+    except OSError as e:
+        print >> stderr, "Removal of %s failed: %s" % (name, e)
+        exit(5)
+
+def RunCommand(command):
+    if debug_flag: print >> stderr, " ".join(command)
+    try:
+        call(command)
+    except OSError as e:
+        print >> stderr, "Execution of %s failed: %s", (command,e)
+        exit(6)
+
+def MergePairs(outdir, pearexe):
+    '''Use PEAR to merge PE reads.
+       
+       http://sco.h-its.org/exelixis/web/software/pear/ is used to merge the 
+       forward and reverse reads. The output files are:
+       1. reads.assembled.fastq
+       2. reads.discarded.fastq
+       3. reads.unassembled.forward.fastq
+       4. reads.unassembled.reverse.fastq
+    '''
+    command = [pearexe,
+               "-f", "%s/read1.fq" % outdir,
+               "-r", "%s/read2.fq" % outdir,
+               "-o", "%s/reads" % outdir,
+               "-q", "30"
+              ]
+
+    RunCommand(command)
+
+def AlignFrags(outdir, faName, bwaexe, samtoolsexe, useLastz, lzexe):
+    '''Align the sequences using BWA or LASTZ.
+    '''
+    if useLastz:
+        command = "%s %s %s/read1.fq[nameparse=darkspace] --format=softsam | %s view -bST %s - | %s sort - %s/alignments" % (lzexe, faName, outdir, samtoolsexe, faName, samtoolsexe, outdir)
+        command = call(command, shell = True)
+    else:
+        # check to if we have an index for the reference genome and build it if 
+        # we do not.
+        indexFileSuffix = ["amb","ann","bwt","pac","sa"]
+        reindex = False
+        for suffix in indexFileSuffix:
+            if not path.exists("%s.%s" % (faName, suffix)):
+                reindex = True
+                break
+
+        if reindex:
+            command = [bwaexe, "index", faName]
+            RunCommand(command)
+
+        # align the sequences to the reference and convert the output to BAM 
+        # format.
+        command = "%s mem %s %s/read1.fq | %s view -bST %s - | %s sort - %s/alignments" % (bwaexe, faName, outdir, samtoolsexe, faName, samtoolsexe, outdir)
+        command = call(command, shell = True)
+
+    command = [samtoolsexe, "index" , "%s/alignments.bam" % outdir]
+    RunCommand(command)
+
+    command = [samtoolsexe, "flagstat" , "%s/alignments.bam" % outdir]
+    RunCommand(command)
+
+def AlignPairs(outdir, faName, bwaexe, samtoolsexe, useLastz, lzexe, skipmerge):
+    '''Align the sequences using BWA or LASTZ.
+    '''
+    if skipmerge:
+        filenames = ["read1.fq", "read2.fq"]
+    else:
+        filenames = ["reads.assembled.fastq",
+                     "reads.unassembled.forward.fastq",
+                     "reads.unassembled.reverse.fastq"]
+    with open("%s/reads.fq" % outdir, "w") as o:
+        for filename in filenames:
+            with open("%s/%s" % (outdir,filename), "r") as i:
+                for line in i:
+                    o.write(line)
+
+    if useLastz:
+        command = "%s %s %s/reads.fq[nameparse=darkspace] --format=softsam | %s view -bST %s - | %s sort - %s/alignments" % (lzexe, faName, outdir, samtoolsexe, faName, samtoolsexe, outdir)
+        command = call(command, shell = True)
+    else:
+        # check to if we have an index for the reference genome and build it if 
+        # we do not.
+        indexFileSuffix = ["amb","ann","bwt","pac","sa"]
+        reindex = False
+        for suffix in indexFileSuffix:
+            if not path.exists("%s.%s" % (faName, suffix)):
+                reindex = True
+                break
+
+        if reindex:
+            command = [bwaexe, "index", faName]
+            RunCommand(command)
+
+        # align the sequences to the reference and convert the output to BAM 
+        # format.
+        command = "%s mem %s %s/reads.fq | %s view -bST %s - | %s sort - %s/alignments" % (bwaexe, faName, outdir, samtoolsexe, faName, samtoolsexe, outdir)
+        command = call(command, shell = True)
+
+    command = ["rm", "%s/reads.fq" % outdir]
+    RunCommand(command)
+
+    command = [samtoolsexe, "index" , "%s/alignments.bam" % outdir]
+    RunCommand(command)
+
+    command = [samtoolsexe, "flagstat" , "%s/alignments.bam" % outdir]
+    RunCommand(command)
+
+def RunQuasiRecomb(outdir, qrexe, skipmerge):
+    currdir = getcwd()
+    chdir(outdir)
+
+    command = ["java", 
+               "-XX:+UseParallelGC", "-XX:NewRatio=9", "-Xms2G", "-Xmx10G", 
+               "-jar", qrexe,
+               "-conservative",
+               "-noRecomb",
+               "-i", "alignments.bam"]
+    if not skipmerge:
+        command.append("-unpaired")
+    RunCommand(command)
+
+    # run with refinement to reduce the false positives
+    command = ["java",
+               "-XX:+UseParallelGC", "-XX:NewRatio=9", "-Xms2G", "-Xmx10G", 
+               "-jar", qrexe,  
+               "-conservative",
+               "-noRecomb",
+               "-refine",
+               "-printAlignment",
+               "-sampleProteins",
+               "-i", "alignments.bam"]
+    if not skipmerge:
+        command.append("-unpaired")
+    RunCommand(command)
+
+    chdir(currdir)
+
+def NextFastaSequence(filename):
+    with open(filename, "r") as f:
+        name = None 
+        sequence = None
+        
+        for line in f:
+            if line.startswith(">"):
+                if name != None:
+                    yield name,sequence
+                name = line.strip()[1:]
+                sequence = ""
+            else:
+                sequence += line.strip()
+
+        if name != None:
+            yield name,sequence
+
+def PrintFastaSequence(name, sequence, f):
+    print >> f, ">%s" % name
+    print >> f, sequence
+
+def FilterQuasispecies(outdir, threshold):
+    filename = "%s/quasispecies.fasta" % outdir
+    outfile  = open("%s/consensus.fa" % outdir, "w")
+
+    for (n1,s1) in NextFastaSequence(filename):
+        s1 = s1.replace('-','')
+        readname,prevelance = n1.split("_")
+        if float(prevelance) > threshold:
+            protein = Seq(s1).translate()
+            counts = Counter(protein)
+
+            if counts['C'] != 2:
+                n1 = n1 + "_2Cviolation"
+            if counts['*'] != 0:
+                n1 = n1 + "stopcodon"
+            PrintFastaSequence(n1, s1, outfile)
+ 
+    outfile.close()
+
+def main(outdir, pearexe, bwaexe, samtoolsexe, qrexe, useLastz, lastz, skipmerge, threshold, faName, fq1Name, fq2Name = None):
+    # create the output directory
+    try:
+        mkdir(outdir)
+    except OSError as e:
+        print >> stderr, "Making of directory %s failed. %s" % (outdir, e)
+        exit(4)
+
+    # remove the PCR duplicates in the sample
+    RemovePCRDups(outdir, fq1Name, fq2Name)
+
+    # merge the pairs into a long sequence
+    if fq2Name and (not skipmerge): MergePairs(outdir, pearexe)
+
+    # align the remainder of the sequence to the reference using a aligner to 
+    # generate a BAM file
+    if fq2Name == None:
+        AlignFrags(outdir, faName, bwaexe, samtoolsexe, useLastz, lastz)
+    else:
+        AlignPairs(outdir,faName,bwaexe,samtoolsexe,useLastz,lastz,skipmerge)
+
+    # run quasiRecomb on the resulting file to create the output
+    RunQuasiRecomb(outdir, qrexe, skipmerge)
+
+    # filter the output from quasirecomb to only show the sequences that are
+    # seen in at least a minimum fraction of the sequences
+    FilterQuasispecies(outdir, threshold)
+
+if __name__ == "__main__":
+    try:
+        opts, args = getopt(argv[1:], "hdo:p:b:s:q:t:l:zx",["help", "debug", "outdir=", "pear=", "bwa=", "samtools=", "quasirecomb=", "threshold=", "lastz=", "uselastz", "skipmerge"])
+    except GetoptError, err:
+        print str(err)
+        print >> stderr, __doc__
+        exit(2) 
+
+    outdir = "report"
+    pearexe = "pear"
+    bwaexe = "bwa"
+    samtoolsexe = "samtools"
+    qsexe = "QuasiRecomb.jar"
+    threshold = 0.01
+    lastzexe = "lastz"
+    useLastz = False
+    skipmerge = False
+
+    for o, a in opts:
+        if o in ("-h", "--help"):
+            print >> stderr, __doc__
+            exit()
+        elif o in ("-d", "--debug"):
+            debug_flag = True
+        elif o in ("-o", "--outdir"):
+            outdir = a
+        elif o in ("-p", "--pear"):
+            pearexe = a
+        elif o in ("-b", "--bwa"):
+            bwaexe = a
+        elif o in ("-s", "--samtools"):
+            samtoolsexe = a
+        elif o in ("-q", "--quasirecomb"):
+            qrexe = a
+        elif o in ("-t", "--threshold"):
+            threshold = float(a)
+        elif o in ("-l", "--lastz"):
+            lastz = a
+        elif o in ("-z", "--uselastz"):
+            useLastz = True
+        elif o in ("-x", "--skipmerge"):
+            skipmerge = True
+        else:
+            assert False, "unhandled option"
+
+    if len(args) not in [2,3]:
+        print >> stderr, __doc__
+        exit(3)
+
+    if len(args) == 2:
+        main(outdir,pearexe,bwaexe,samtoolsexe,qrexe,useLastz,lastz,skipmerge,threshold,args[0],args[1])
+    else:
+        main(outdir,pearexe,bwaexe,samtoolsexe,qrexe,useLastz,lastz,skipmerge,threshold,args[0],args[1],args[2])
